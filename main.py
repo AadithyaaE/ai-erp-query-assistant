@@ -175,18 +175,18 @@ else:
    
 
 
-# summary_prompt = f"""
-# Question:
-# {question}
+summary_prompt = f"""
+Question:
+{question}
+    
+Result:
+{result}
 
-# Result:
-# {result}
+Answer naturally.
+"""
 
-# Answer naturally.
-# """
+answer = llm.invoke(summary_prompt)
 
-# answer = llm.invoke(summary_prompt)
-
-# print(answer.content)
+print(answer.content)
 
 
