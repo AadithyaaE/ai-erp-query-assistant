@@ -5,9 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==========================
 # DATABASE CONNECTION
-# ==========================
+
 
 try:
     conn = mysql.connector.connect(
@@ -37,9 +36,43 @@ llm = ChatGoogleGenerativeAI(
 
 schema = db.get_table_info()
 
-# ==========================
+print("\n===== LOGIN =====")
+
+username = input("Username: ").strip()
+password = input("Password: ").strip()
+
+cursor.execute("""
+SELECT role,
+       student_id,
+       faculty_id
+FROM users
+WHERE username = %s
+AND password = %s
+""", (username, password))
+
+user = cursor.fetchone()
+
+if user is None:
+
+    print("Invalid username or password.")
+    exit()
+
+role = user[0]
+student_id = user[1]
+faculty_id = user[2]
+
+print("\nLogin Successful!")
+print("Role:", role)
+
+if student_id:
+    print("Student ID:", student_id)
+
+if faculty_id:
+    print("Faculty ID:", faculty_id)
+
+
 # MAIN LOOP
-# ==========================
+
 
 while True:
 
@@ -51,9 +84,9 @@ while True:
         print("Goodbye!")
         break
 
-    # ==========================
+    
     # BLOCK DANGEROUS REQUESTS
-    # ==========================
+   
 
     dangerous_words = [
         "delete",
@@ -62,7 +95,6 @@ while True:
         "insert",
         "remove",
         "truncate",
-        
         "alter",
         "modify"
     ]
@@ -71,9 +103,9 @@ while True:
         print("Only SELECT queries are allowed.")
         continue
 
-    # ==========================
+   
     # DUPLICATE NAME CHECK
-    # ==========================
+
 
     cursor.execute("""
     SELECT name
@@ -116,15 +148,18 @@ while True:
     if duplicate_found:
         continue
 
-    # ==========================
-    # PROMPT
-    # ==========================
+   
 
-    prompt = f"""
+    prompt =  f"""
 You are an expert MySQL developer.
 
 Database Schema:
 {schema}
+
+Logged In User Information:
+- Role: {role}
+- Student ID: {student_id}
+- Faculty ID: {faculty_id}
 
 Your task is to convert the user's question into a SQL query.
 
@@ -136,19 +171,74 @@ Rules:
 - Only SELECT queries.
 - Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE statements.
 - Use only tables and columns present in the schema.
-- When a question refers to pending fees, unpaid fees, or dues, the query must filter using:
-  WHERE payment_status = 'PENDING'
+- If the question cannot be answered using the schema, generate the closest valid SELECT query possible.
+
+Fee Rules:
 - fees.payment_status can contain:
   'PAID', 'PENDING', or 'PARTIAL'
-- If the question cannot be answered using the schema, generate the closest valid SELECT query possible.
+- When a question refers to pending fees, unpaid fees, dues, outstanding fees, or fee defaulters, always filter using:
+  payment_status = 'PENDING'
+
+Role-Based Rules:
+
+Admin:
+- Full access to all tables and records.
+
+Teacher:
+- Can access students, subjects, marks, attendance, departments, faculty, placements, scholarships, and exams.
+- Cannot access fee information.
+- Never generate queries on the fees table for teachers.
+
+Student:
+- Can access ONLY their own records.
+- Never access records belonging to other students.
+- For questions containing words like:
+  "my", "me", "mine", "I"
+  always filter using the logged-in student ID.
+- For marks, attendance, fees, scholarships, placements, and profile information:
+  always include:
+    WHERE student_id = {student_id}
+- Never generate queries that return information about all students.
+- Never generate queries about another student's records.
+
+Examples:
+
+Question:
+What are my marks?
+
+SQL:
+SELECT *
+FROM marks
+WHERE student_id = {student_id};
+
+Question:
+Show my attendance
+
+SQL:
+SELECT *
+FROM attendance
+WHERE student_id = {student_id};
+
+Question:
+Do I have pending fees?
+
+SQL:
+SELECT *
+FROM fees
+WHERE student_id = {student_id}
+AND payment_status = 'PENDING';
+
+Question:
+Show all students
+
+For a student user, do not generate a query returning all students.
+Instead restrict the query to the logged-in student's records.
 
 Question:
 {question}
 """
 
-    # ==========================
-    # GEMINI CALL
-    # ==========================
+   #Check for gemini quota exceeded
 
     try:
 
@@ -172,9 +262,8 @@ Question:
     print("\nGenerated SQL:")
     print(response.content)
 
-    # ==========================
     # CLEAN SQL
-    # ==========================
+    
 
     sql_query = response.content
 
@@ -190,9 +279,58 @@ Question:
 
     sql_query = sql_query.strip()
 
-    # ==========================
+
+    sql_lower = sql_query.lower()
+    if role == "teacher":
+
+        if "fees" in sql_lower:
+
+            print(
+                "Access Denied. Teachers cannot access fee information."
+            )
+
+            continue
+
+
+    if role == "student":
+
+        blocked_tables = [
+            "faculty",
+            "users"
+        ]
+
+        access_denied = False
+
+        for table in blocked_tables:
+
+            if table in sql_lower:
+
+                print(
+                    "Access Denied. Students cannot access this information."
+                )
+
+                access_denied = True
+                break
+
+        if access_denied:
+            continue
+
+        student_filter_1 = f"student_id = {student_id}".lower()
+        student_filter_2 = f"student_id={student_id}".lower()
+
+        if (
+            student_filter_1 not in sql_lower
+            and student_filter_2 not in sql_lower
+        ):
+
+            print(
+                "Access Denied. Students can only access their own records."
+            )
+
+            continue
+   
     # ALLOW ONLY SELECT
-    # ==========================
+   
 
     if not sql_query.upper().startswith(
         "SELECT"
@@ -204,10 +342,9 @@ Question:
 
         continue
 
-    # ==========================
-    # EXECUTE QUERY
-    # ==========================
 
+    # EXECUTE QUERY
+   
     try:
 
         result = db.run(sql_query)
@@ -239,9 +376,7 @@ Question:
 
         continue
 
-    # ==========================
-    # NATURAL LANGUAGE ANSWER
-    # ==========================
+    
 
     summary_prompt = f"""
 Question:
@@ -252,6 +387,13 @@ Result:
 
 Answer naturally in one or two sentences.
 """
+
+    try:
+        summary_response = llm.invoke(summary_prompt)
+        print("\nAnswer:")
+        print(summary_response.content)
+    except Exception as e:
+        print("Summary generation failed:", e)
 
     try:
 
@@ -266,9 +408,7 @@ Answer naturally in one or two sentences.
 
         pass
 
-# ==========================
-# CLOSE CONNECTIONS
-# ==========================
+
 
 cursor.close()
 conn.close()
