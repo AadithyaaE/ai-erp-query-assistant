@@ -1,6 +1,7 @@
 from langchain_community.utilities import SQLDatabase
 from langchain_google_genai import ChatGoogleGenerativeAI
 import mysql.connector
+import bcrypt
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,14 +41,15 @@ print("\n===== LOGIN =====")
 username = input("Username: ").strip()
 password = input("Password: ").strip()
 
+#LOGIN LOGIC
 cursor.execute("""
-SELECT role,
+SELECT password,
+       role,
        student_id,
        faculty_id
 FROM users
 WHERE username = %s
-AND password = %s
-""", (username, password))
+""", (username,))
 
 user = cursor.fetchone()
 
@@ -55,9 +57,18 @@ if user is None:
     print("Invalid username or password.")
     exit()
 
-role = user[0]
-student_id = user[1]
-faculty_id = user[2]
+stored_hash = user[0]
+
+if not bcrypt.checkpw(
+    password.encode(),
+    stored_hash.encode()
+):
+    print("Invalid username or password.")
+    exit()
+
+role = user[1]
+student_id = user[2]
+faculty_id = user[3]
 
 print("\nLogin Successful!")
 print("Role:", role)
@@ -77,6 +88,136 @@ while True:
     if question.lower() == "exit":
         print("Goodbye!")
         break
+
+        # ==========================
+    # ADMIN QUERY HISTORY
+    # ==========================
+
+    if role == "admin" and question.lower() == "show recent activity":
+
+        cursor.execute("""
+        SELECT username,
+               question,
+               created_at
+        FROM query_logs
+        ORDER BY created_at DESC
+        LIMIT 20
+        """)
+
+        logs = cursor.fetchall()
+
+        print("\nRecent Activity:")
+
+        for row in logs:
+            print(row)
+
+        continue
+
+    #TO FIND MOST ACTIVE USERS
+    if role == "admin" and question.lower() == "show most active users":
+
+        cursor.execute("""
+        SELECT username,
+            COUNT(*) AS total_queries
+        FROM query_logs
+        GROUP BY username
+        ORDER BY total_queries DESC
+        LIMIT 10
+        """)
+
+        results = cursor.fetchall()
+
+        print("\nMost Active Users:")
+
+        for row in results:
+            print(row)
+
+        continue
+
+    #TO FIND FAILED QUERIES
+    if role == "admin" and question.lower() == "show failed queries":
+
+        cursor.execute("""
+        SELECT username,
+            question,
+            created_at
+        FROM query_logs
+        WHERE status = 'FAILED'
+        ORDER BY created_at DESC
+        LIMIT 20
+        """)
+
+        results = cursor.fetchall()
+
+        print("\nFailed Queries:")
+
+        for row in results:
+            print(row)
+
+        continue
+
+    #QUERY COUNT BY ROLE
+    if role == "admin" and question.lower() == "show query statistics":
+
+        cursor.execute("""
+        SELECT role,
+            COUNT(*)
+        FROM query_logs
+        GROUP BY role
+        """)
+
+        results = cursor.fetchall()
+
+        print("\nQuery Statistics:")
+
+        for row in results:
+            print(row)
+
+        continue
+
+    #TOTAL QUERIES TODAY   
+    if role == "admin" and question.lower() == "show total queries today":
+
+        cursor.execute("""
+        SELECT COUNT(*)
+        FROM query_logs
+        WHERE DATE(created_at) = CURDATE()
+        """)
+
+        result = cursor.fetchone()
+
+        print(
+            f"\nTotal Queries Today: {result[0]}"
+        )
+
+        continue
+
+    # ==========================
+    # USER QUERY HISTORY
+    # ==========================
+
+    if question.lower() == "show my query history":
+
+        cursor.execute("""
+        SELECT question,
+               created_at
+        FROM query_logs
+        WHERE username = %s
+        ORDER BY created_at DESC
+        LIMIT 10
+        """, (username,))
+
+        history = cursor.fetchall()
+
+        print("\nRecent Queries:")
+
+        for i, row in enumerate(history, start=1):
+
+            print(
+                f"{i}. {row[0]} | {row[1]}"
+            )
+
+        continue
 
     # BLOCK DANGEROUS REQUESTS
     dangerous_words = [
@@ -148,7 +289,30 @@ General Rules:
 - Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, or REPLACE statements.
 - Use only tables and columns present in the schema.
 - Generate syntactically correct MySQL queries.
-- If the question cannot be answered using the schema, generate the closest valid SELECT query possible.
+IMPORTANT:
+
+Before generating SQL, determine whether the user's question can be answered using ONLY the provided database schema.
+
+If the question:
+- References topics unrelated to the ERP database
+- Mentions entities not present in the schema
+- Asks about sports, weather, politics, celebrities, history, current events, or general knowledge
+- References tables or columns that do not exist
+
+Then output exactly:
+
+INVALID_QUERY
+
+Do not attempt to guess.
+Do not attempt to find a similar table.
+Do not generate a "closest" query.
+Do not generate any SQL except INVALID_QUERY.
+
+- Never guess.
+- Never assume table names, column names, or values.
+- If a requested table, column, or entity does not exist in the schema, output:
+
+INVALID_QUERY
 
 Fee Rules:
 - fees.payment_status can contain:
@@ -271,6 +435,14 @@ Question:
     sql_query = sql_query.replace("```", "")
     sql_query = sql_query.strip()
 
+    if sql_query == "INVALID_QUERY":
+
+        print(
+            "The question cannot be answered using the available database schema."
+        )
+
+        continue
+
     sql_lower = sql_query.lower()
     if role == "teacher":
         if "fees" in sql_lower:
@@ -308,6 +480,23 @@ Question:
     # EXECUTE QUERY
     try:
         result = db.run(sql_query)
+
+        cursor.execute("""
+        INSERT INTO query_logs
+        (username, role, question, generated_sql, status)
+        VALUES (%s, %s, %s, %s, %s)
+        """, (
+            username,
+            role,
+            question,
+            sql_query,
+            "SUCCESS"
+        ))
+
+        conn.commit()
+
+        
+
         if not result:
             print("No matching records found.")
             continue
@@ -319,8 +508,24 @@ Question:
         print(result)
 
     except Exception as e:
+
+        cursor.execute("""
+        INSERT INTO query_logs
+        (username, role, question, generated_sql, status)
+        VALUES (%s, %s, %s, %s, %s)
+        """, (
+            username,
+            role,
+            question,
+            sql_query,
+            "FAILED"
+        ))
+
+        conn.commit()
+
         print("Invalid SQL generated.")
         print(e)
+
         continue
 
     summary_prompt = f"""
@@ -340,12 +545,7 @@ Answer naturally in one or two sentences.
     except Exception as e:
         print("Summary generation failed:", e)
 
-    try:
-        answer = llm.invoke(summary_prompt)
-        print("\nAnswer:")
-        print(answer.content)
-    except Exception:
-        pass
+  
 
 
 cursor.close()
